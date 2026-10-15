@@ -83,34 +83,36 @@ def _client() -> httpx.Client:
     return httpx.Client(timeout=15.0)
 
 
-def db_select(table: str, params: dict) -> list[dict]:
+def _rest_call(method: str, table: str, extra: Optional[dict] = None, **kwargs) -> httpx.Response:
+    """Call the Supabase Data API, trying both header styles for the secret key."""
+    variants = [_server_headers(extra)]
+    if "Authorization" not in variants[0]:
+        variants.append(_server_headers({**(extra or {}), "Authorization": f"Bearer {SUPABASE_KEY}"}))
+    last = None
     with _client() as c:
-        r = c.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=_server_headers())
+        for headers in variants:
+            last = c.request(method, f"{SUPABASE_URL}/rest/v1/{table}", headers=headers, **kwargs)
+            if last.status_code not in (401, 403):
+                return last
+    return last
+
+
+def db_select(table: str, params: dict) -> list[dict]:
+    r = _rest_call("GET", table, params=params)
     if r.status_code >= 400:
         raise HTTPException(502, f"Database read failed ({table}).")
     return r.json()
 
 
 def db_insert(table: str, rows: list[dict] | dict) -> list[dict]:
-    with _client() as c:
-        r = c.post(
-            f"{SUPABASE_URL}/rest/v1/{table}",
-            json=rows,
-            headers=_server_headers({"Prefer": "return=representation"}),
-        )
+    r = _rest_call("POST", table, {"Prefer": "return=representation"}, json=rows)
     if r.status_code >= 400:
         raise HTTPException(502, f"Database write failed ({table}).")
     return r.json()
 
 
 def db_update(table: str, params: dict, values: dict) -> list[dict]:
-    with _client() as c:
-        r = c.patch(
-            f"{SUPABASE_URL}/rest/v1/{table}",
-            params=params,
-            json=values,
-            headers=_server_headers({"Prefer": "return=representation"}),
-        )
+    r = _rest_call("PATCH", table, {"Prefer": "return=representation"}, params=params, json=values)
     if r.status_code >= 400:
         raise HTTPException(502, f"Database update failed ({table}).")
     return r.json()
@@ -129,6 +131,23 @@ def same_name(a: str, b: str) -> bool:
 # Authentication (Supabase Auth, email + password)
 # ---------------------------------------------------------------------------
 
+def _auth_call(method: str, path: str, **kwargs) -> httpx.Response:
+    """Call Supabase Auth with the secret key.
+
+    New "sb_secret_" keys and legacy "service_role" JWT keys expect slightly
+    different headers, so try the apikey-only form first, then apikey + Bearer.
+    """
+    variants = [_server_headers()]
+    if "Authorization" not in variants[0]:
+        variants.append(_server_headers({"Authorization": f"Bearer {SUPABASE_KEY}"}))
+    last = None
+    with _client() as c:
+        for headers in variants:
+            last = c.request(method, f"{SUPABASE_URL}/auth/v1{path}", headers=headers, **kwargs)
+            if last.status_code not in (401, 403):
+                return last
+    return last
+
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
@@ -138,13 +157,7 @@ class Credentials(BaseModel):
 
 
 def _password_login(email: str, password: str) -> dict:
-    with _client() as c:
-        r = c.post(
-            f"{SUPABASE_URL}/auth/v1/token",
-            params={"grant_type": "password"},
-            json={"email": email, "password": password},
-            headers=_server_headers(),
-        )
+    r = _auth_call("POST", "/token", params={"grant_type": "password"}, json={"email": email, "password": password})
     if r.status_code != 200:
         # Deliberately vague: do not reveal whether the email exists.
         raise HTTPException(401, "Email or password is incorrect.")
@@ -304,9 +317,15 @@ router = APIRouter()
 
 
 @router.get("/health")
-def health() -> dict:
+def health(probe: int = 0) -> dict:
     # Reports only WHETHER the variables exist, never their values.
-    return {"ok": True, "supabaseConfigured": bool(SUPABASE_URL and SUPABASE_KEY)}
+    out = {"ok": True, "supabaseConfigured": bool(SUPABASE_URL and SUPABASE_KEY)}
+    if probe and out["supabaseConfigured"]:
+        # Connectivity check: HTTP status codes only, no data is returned.
+        out["keyType"] = "legacy-jwt" if SUPABASE_KEY.startswith("eyJ") else SUPABASE_KEY.split("_")[0] + "_" + SUPABASE_KEY.split("_")[1] if "_" in SUPABASE_KEY else "other"
+        out["database"] = _rest_call("GET", "houses", params={"select": "id", "limit": "1"}).status_code
+        out["authAdmin"] = _auth_call("GET", "/admin/users", params={"per_page": "1"}).status_code
+    return out
 
 
 @router.post("/auth/signup")
@@ -314,17 +333,25 @@ def signup(body: Credentials) -> dict:
     email = body.email.strip().lower()
     if not EMAIL_RE.match(email):
         raise HTTPException(400, "Enter a valid email address.")
-    with _client() as c:
-        r = c.post(
-            f"{SUPABASE_URL}/auth/v1/admin/users",
-            json={"email": email, "password": body.password, "email_confirm": True},
-            headers=_server_headers(),
-        )
-    if r.status_code == 422 or (r.status_code >= 400 and "already" in r.text.lower()):
+    # Preferred: create a confirmed user with the admin API (no email needed).
+    r = _auth_call("POST", "/admin/users", json={"email": email, "password": body.password, "email_confirm": True})
+    if r.status_code in (200, 201):
+        return _password_login(email, body.password)
+    if r.status_code == 422 or "already" in r.text.lower() or "exists" in r.text.lower():
         raise HTTPException(409, "An account with this email already exists. Log in instead.")
-    if r.status_code >= 400:
-        raise HTTPException(502, "Could not create the account. Please try again.")
-    return _password_login(email, body.password)
+    if r.status_code == 400 and "password" in r.text.lower():
+        raise HTTPException(400, "Choose a stronger password (at least 8 characters).")
+
+    # Fallback: the normal public sign-up endpoint.
+    r2 = _auth_call("POST", "/signup", json={"email": email, "password": body.password})
+    if r2.status_code in (200, 201):
+        data = r2.json()
+        if data.get("access_token"):
+            return {"accessToken": data["access_token"], "email": email}
+        raise HTTPException(400, "Account created. Please confirm your email, then log in.")
+    if "already" in r2.text.lower() or "exists" in r2.text.lower():
+        raise HTTPException(409, "An account with this email already exists. Log in instead.")
+    raise HTTPException(502, f"Could not create the account (code {r.status_code}/{r2.status_code}). Please try again.")
 
 
 @router.post("/auth/login")
