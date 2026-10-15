@@ -540,7 +540,6 @@ def create_handover(body: NewHandover, user: dict = Depends(current_user)) -> di
             "bond_contribution": me.get("bond_contribution"),
         },
     )[0]
-    db_update("residents", {"id": f"eq.{me['id']}"}, {"is_current": False, "move_out_date": when})
     record["incoming_resident_id"] = incoming["id"]
     saved = db_insert("handovers", record)[0]
     db_insert(
@@ -551,6 +550,8 @@ def create_handover(body: NewHandover, user: dict = Depends(current_user)) -> di
                 "kind": "handover",
                 "entry_date": when,
                 "description": f"Handover signed — liability boundary set with {incoming['first_name']}",
+                # Batch inserts need the same keys on every row.
+                "resident_id": None,
                 "created_by": user["id"],
             },
             {
@@ -571,6 +572,8 @@ def create_handover(body: NewHandover, user: dict = Depends(current_user)) -> di
             },
         ],
     )
+    # Only now set the boundary: the outgoing renter moves out.
+    db_update("residents", {"id": f"eq.{me['id']}"}, {"is_current": False, "move_out_date": when})
     return {"result": "success", "handover": to_handover(saved), "state": build_state(user)}
 
 
