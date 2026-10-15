@@ -1,0 +1,24 @@
+node_modules
+dist
+dist-ssr
+*.local
+*.log
+
+# Secrets: never commit real keys
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Vercel
+.vercel
+
+# Editor / OS
+.vscode/*
+.idea
+.DS_Store
